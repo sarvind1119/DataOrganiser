@@ -1,0 +1,26 @@
+[project]
+name = "data-organiser"
+version = "1.0.0"
+description = "AI-powered file organizer with smart content classification"
+requires-python = ">=3.10"
+dependencies = [
+    "PyQt6>=6.6.0",
+    "pymupdf>=1.24.0",          # PDF text extraction
+    "python-docx>=1.1.0",       # Word document reading
+    "openpyxl>=3.1.0",          # Excel reading
+    "python-pptx>=0.6.23",      # PowerPoint reading
+    "Pillow>=10.0.0",           # Image metadata/EXIF
+    "send2trash>=1.8.0",        # Safe file deletion
+    "chardet>=5.0.0",           # Text encoding detection
+]
+
+[project.optional-dependencies]
+ai = ["ollama>=0.3.0"]          # Optional: Local LLM via Ollama
+dev = ["pytest>=8.0", "pytest-qt>=4.0"]
+
+[project.scripts]
+data-organiser = "src.main:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
