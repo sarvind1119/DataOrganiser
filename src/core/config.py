@@ -41,9 +41,12 @@ class AppConfig:
     skip_dirs: set[str] = field(default_factory=lambda: set(SKIP_DIRS))
     skip_files: set[str] = field(default_factory=lambda: set(SKIP_FILES))
     use_llm: bool = True
+    use_ocr: bool = True
+    use_cache: bool = True
     dry_run: bool = True  # Default to dry-run for safety
     detect_duplicates: bool = True
     custom_rules: list[dict] = field(default_factory=list)
+    watch_dir: str = ""
     last_scan_dir: str = ""
     last_output_dir: str = ""
 

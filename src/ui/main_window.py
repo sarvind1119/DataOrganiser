@@ -2,25 +2,27 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from collections import Counter
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QFont, QIcon, QColor
+from PyQt6.QtGui import QFont, QIcon, QColor, QPixmap
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QProgressBar, QTreeWidget, QTreeWidgetItem,
     QTabWidget, QTextEdit, QCheckBox, QComboBox, QGroupBox,
     QSplitter, QStatusBar, QMessageBox, QHeaderView, QLineEdit,
-    QFrame, QSizePolicy, QApplication,
+    QFrame, QSizePolicy, QApplication, QTableWidget, QTableWidgetItem,
+    QScrollArea,
 )
 
 from src.core.config import AppConfig, MANIFEST_DIR
-from src.core.models import FileCategory, FileInfo, OrganizeResult
+from src.core.models import FileCategory, FileInfo, FileType, OrganizeResult
 from src.core.scanner import FileScanner
 from src.core.organizer import FileOrganizer
-from src.ui.workers import ScanWorker, ClassifyWorker, OrganizeWorker
+from src.ui.workers import ScanWorker, ClassifyWorker, OrganizeWorker, WatcherWorker
 
 # Color palette
 COLORS = {
@@ -36,6 +38,12 @@ COLORS = {
     "border": "#E2E8F0",
 }
 
+# Image extensions for thumbnail preview
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".ico", ".tiff"}
+
+# All category values for the dropdown
+ALL_CATEGORIES = [cat.value for cat in FileCategory]
+
 
 class MainWindow(QMainWindow):
     """Main application window."""
@@ -47,6 +55,7 @@ class MainWindow(QMainWindow):
         self.scan_worker: ScanWorker | None = None
         self.classify_worker: ClassifyWorker | None = None
         self.organize_worker: OrganizeWorker | None = None
+        self.watcher_worker: WatcherWorker | None = None
 
         self._setup_ui()
         self._apply_styles()
@@ -63,39 +72,39 @@ class MainWindow(QMainWindow):
         main_layout.setContentsMargins(16, 16, 16, 16)
         main_layout.setSpacing(12)
 
-        # ── Header ──
+        # -- Header --
         header = self._create_header()
         main_layout.addWidget(header)
 
-        # ── Directory Selection ──
+        # -- Directory Selection --
         dir_group = self._create_dir_selection()
         main_layout.addWidget(dir_group)
 
-        # ── Main Content (Splitter: Tree + Details) ──
+        # -- Main Content (Splitter: Tree + Details) --
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Left: File tree
         left_panel = self._create_file_tree_panel()
         splitter.addWidget(left_panel)
 
-        # Right: Tabs (Preview, Stats, Settings, Undo)
+        # Right: Tabs (Preview, Stats, Settings, Undo, Custom Rules, Watchdog)
         right_panel = self._create_right_panel()
         splitter.addWidget(right_panel)
 
         splitter.setSizes([600, 400])
         main_layout.addWidget(splitter, stretch=1)
 
-        # ── Progress Bar ──
+        # -- Progress Bar --
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
         main_layout.addWidget(self.progress_bar)
 
-        # ── Action Buttons ──
+        # -- Action Buttons --
         actions = self._create_action_buttons()
         main_layout.addWidget(actions)
 
-        # ── Status Bar ──
+        # -- Status Bar --
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
         self.status_bar.showMessage("Ready. Select a directory to begin.")
@@ -159,9 +168,20 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # Header row with label and export button
+        header_row = QHBoxLayout()
         label = QLabel("Organized File Preview")
         label.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        layout.addWidget(label)
+        header_row.addWidget(label)
+        header_row.addStretch()
+
+        self.btn_export = QPushButton("Export CSV")
+        self.btn_export.setFixedHeight(28)
+        self.btn_export.clicked.connect(self._export_csv)
+        self.btn_export.setEnabled(False)
+        header_row.addWidget(self.btn_export)
+
+        layout.addLayout(header_row)
 
         self.file_tree = QTreeWidget()
         self.file_tree.setHeaderLabels(["Name", "Category", "Confidence", "Size"])
@@ -181,11 +201,40 @@ class MainWindow(QMainWindow):
     def _create_right_panel(self) -> QTabWidget:
         self.tabs = QTabWidget()
 
-        # Tab 1: File Details / Preview
+        # Tab 1: File Details / Preview (with thumbnail area)
+        details_widget = QWidget()
+        details_layout = QVBoxLayout(details_widget)
+        details_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Thumbnail label for image preview
+        self.thumbnail_label = QLabel()
+        self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.thumbnail_label.setMinimumHeight(20)
+        self.thumbnail_label.setMaximumHeight(250)
+        self.thumbnail_label.setVisible(False)
+        self.thumbnail_label.setStyleSheet("background-color: #F1F5F9; border-radius: 6px; padding: 4px;")
+        details_layout.addWidget(self.thumbnail_label)
+
+        # Category reassignment dropdown
+        reassign_row = QHBoxLayout()
+        reassign_row.addWidget(QLabel("Reassign:"))
+        self.category_combo = QComboBox()
+        self.category_combo.addItems(ALL_CATEGORIES)
+        self.category_combo.setEnabled(False)
+        reassign_row.addWidget(self.category_combo, stretch=1)
+        self.btn_reassign = QPushButton("Apply")
+        self.btn_reassign.setFixedHeight(28)
+        self.btn_reassign.setEnabled(False)
+        self.btn_reassign.clicked.connect(self._reassign_category)
+        reassign_row.addWidget(self.btn_reassign)
+        details_layout.addLayout(reassign_row)
+
         self.detail_text = QTextEdit()
         self.detail_text.setReadOnly(True)
         self.detail_text.setFont(QFont("Consolas", 10))
-        self.tabs.addTab(self.detail_text, "File Details")
+        details_layout.addWidget(self.detail_text)
+
+        self.tabs.addTab(details_widget, "File Details")
 
         # Tab 2: Statistics
         self.stats_text = QTextEdit()
@@ -196,7 +245,15 @@ class MainWindow(QMainWindow):
         settings_widget = self._create_settings_tab()
         self.tabs.addTab(settings_widget, "Settings")
 
-        # Tab 4: Undo History
+        # Tab 4: Custom Rules
+        rules_widget = self._create_custom_rules_tab()
+        self.tabs.addTab(rules_widget, "Custom Rules")
+
+        # Tab 5: Folder Monitor
+        monitor_widget = self._create_monitor_tab()
+        self.tabs.addTab(monitor_widget, "Folder Monitor")
+
+        # Tab 6: Undo History
         undo_widget = self._create_undo_tab()
         self.tabs.addTab(undo_widget, "Undo History")
 
@@ -220,6 +277,18 @@ class MainWindow(QMainWindow):
         model_layout.addWidget(self.model_input)
         layout.addLayout(model_layout)
 
+        # OCR toggle
+        self.chk_use_ocr = QCheckBox("Use OCR for scanned PDFs and images (requires Tesseract)")
+        self.chk_use_ocr.setChecked(self.config.use_ocr)
+        self.chk_use_ocr.toggled.connect(lambda v: setattr(self.config, "use_ocr", v))
+        layout.addWidget(self.chk_use_ocr)
+
+        # Cache toggle
+        self.chk_use_cache = QCheckBox("Cache classification results (faster re-scans)")
+        self.chk_use_cache.setChecked(self.config.use_cache)
+        self.chk_use_cache.toggled.connect(lambda v: setattr(self.config, "use_cache", v))
+        layout.addWidget(self.chk_use_cache)
+
         # Duplicate detection
         self.chk_dedup = QCheckBox("Detect and skip duplicate files")
         self.chk_dedup.setChecked(self.config.detect_duplicates)
@@ -232,10 +301,16 @@ class MainWindow(QMainWindow):
         self.chk_dry_run.toggled.connect(lambda v: setattr(self.config, "dry_run", v))
         layout.addWidget(self.chk_dry_run)
 
-        # Save settings button
+        # Save / Clear cache buttons
+        btn_row = QHBoxLayout()
         btn_save = QPushButton("Save Settings")
         btn_save.clicked.connect(self._save_settings)
-        layout.addWidget(btn_save)
+        btn_row.addWidget(btn_save)
+
+        btn_clear_cache = QPushButton("Clear Cache")
+        btn_clear_cache.clicked.connect(self._clear_cache)
+        btn_row.addWidget(btn_clear_cache)
+        layout.addLayout(btn_row)
 
         # Library status section
         layout.addSpacing(16)
@@ -245,12 +320,103 @@ class MainWindow(QMainWindow):
 
         self.lib_status_text = QTextEdit()
         self.lib_status_text.setReadOnly(True)
-        self.lib_status_text.setMaximumHeight(140)
+        self.lib_status_text.setMaximumHeight(160)
         self.lib_status_text.setFont(QFont("Consolas", 9))
         layout.addWidget(self.lib_status_text)
         self._refresh_lib_status()
 
         layout.addStretch()
+        return widget
+
+    def _create_custom_rules_tab(self) -> QWidget:
+        """Tab for user-defined keyword-to-category rules."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        info = QLabel("Define custom rules: if a file's name or content contains the keywords, it gets the category.")
+        info.setWordWrap(True)
+        info.setFont(QFont("Segoe UI", 9))
+        info.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(info)
+
+        # Rules table
+        self.rules_table = QTableWidget(0, 2)
+        self.rules_table.setHorizontalHeaderLabels(["Keywords (comma-separated)", "Category"])
+        self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        layout.addWidget(self.rules_table)
+
+        # Load existing rules
+        self._load_rules_to_table()
+
+        # Buttons
+        btn_row = QHBoxLayout()
+
+        btn_add = QPushButton("Add Rule")
+        btn_add.clicked.connect(self._add_rule_row)
+        btn_row.addWidget(btn_add)
+
+        btn_remove = QPushButton("Remove Selected")
+        btn_remove.clicked.connect(self._remove_rule_row)
+        btn_row.addWidget(btn_remove)
+
+        btn_save_rules = QPushButton("Save Rules")
+        btn_save_rules.clicked.connect(self._save_rules)
+        btn_row.addWidget(btn_save_rules)
+
+        layout.addLayout(btn_row)
+        return widget
+
+    def _create_monitor_tab(self) -> QWidget:
+        """Tab for real-time folder monitoring (watchdog)."""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        info = QLabel("Monitor a folder for new files and auto-classify them in real-time.")
+        info.setWordWrap(True)
+        info.setFont(QFont("Segoe UI", 9))
+        info.setStyleSheet(f"color: {COLORS['text_secondary']};")
+        layout.addWidget(info)
+
+        # Watch directory selection
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(QLabel("Watch:"))
+        self.watch_input = QLineEdit()
+        self.watch_input.setPlaceholderText("Select folder to monitor...")
+        self.watch_input.setReadOnly(True)
+        if self.config.watch_dir:
+            self.watch_input.setText(self.config.watch_dir)
+        dir_row.addWidget(self.watch_input, stretch=1)
+
+        btn_browse_watch = QPushButton("Browse")
+        btn_browse_watch.clicked.connect(self._browse_watch_dir)
+        dir_row.addWidget(btn_browse_watch)
+        layout.addLayout(dir_row)
+
+        # Start/Stop buttons
+        btn_row = QHBoxLayout()
+        self.btn_start_watch = QPushButton("Start Monitoring")
+        self.btn_start_watch.clicked.connect(self._start_watching)
+        btn_row.addWidget(self.btn_start_watch)
+
+        self.btn_stop_watch = QPushButton("Stop Monitoring")
+        self.btn_stop_watch.clicked.connect(self._stop_watching)
+        self.btn_stop_watch.setEnabled(False)
+        btn_row.addWidget(self.btn_stop_watch)
+        layout.addLayout(btn_row)
+
+        # Watch status
+        self.watch_status = QLabel("Status: Not monitoring")
+        self.watch_status.setFont(QFont("Segoe UI", 10))
+        layout.addWidget(self.watch_status)
+
+        # Log of detected files
+        self.watch_log = QTextEdit()
+        self.watch_log.setReadOnly(True)
+        self.watch_log.setFont(QFont("Consolas", 9))
+        self.watch_log.setPlaceholderText("New files will appear here...")
+        layout.addWidget(self.watch_log)
+
         return widget
 
     def _create_undo_tab(self) -> QWidget:
@@ -307,7 +473,7 @@ class MainWindow(QMainWindow):
 
         return widget
 
-    # ── Directory Browsing ──
+    # -- Directory Browsing --
 
     def _browse_source(self):
         path = QFileDialog.getExistingDirectory(self, "Select Directory to Scan")
@@ -323,7 +489,13 @@ class MainWindow(QMainWindow):
             self.output_input.setText(path)
             self.config.last_output_dir = path
 
-    # ── Scan ──
+    def _browse_watch_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Directory to Monitor")
+        if path:
+            self.watch_input.setText(path)
+            self.config.watch_dir = path
+
+    # -- Scan --
 
     def _start_scan(self):
         source = self.source_input.text()
@@ -354,7 +526,6 @@ class MainWindow(QMainWindow):
             dupes = scanner.find_duplicates(files)
             dup_count = 0
             for hash_val, group in dupes.items():
-                # Keep the first, mark rest as duplicates
                 for fi in group[1:]:
                     fi.is_duplicate = True
                     dup_count += 1
@@ -369,7 +540,7 @@ class MainWindow(QMainWindow):
         self.btn_classify.setEnabled(True)
         self._check_llm_status()
 
-    # ── Classify ──
+    # -- Classify --
 
     def _start_classify(self):
         if not self.files:
@@ -388,20 +559,22 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(current)
         self.progress_bar.setFormat(f"{current}/{total} - {status}")
 
-    def _on_classify_finished(self, files: list[FileInfo]):
+    def _on_classify_finished(self, files: list[FileInfo], cache_hits: int):
         self.files = files
         self._set_busy(False)
         self._populate_tree()
         self._update_stats()
+        self.btn_export.setEnabled(True)
 
+        cache_msg = f" ({cache_hits} from cache)" if cache_hits > 0 else ""
         output = self.output_input.text()
         if output:
             self.btn_organize.setEnabled(True)
-            self.status_bar.showMessage("Classification complete. Review and click 'Organize'.")
+            self.status_bar.showMessage(f"Classification complete{cache_msg}. Review and click 'Organize'.")
         else:
-            self.status_bar.showMessage("Classification complete. Select an output directory, then click 'Organize'.")
+            self.status_bar.showMessage(f"Classification complete{cache_msg}. Select an output directory, then click 'Organize'.")
 
-    # ── Organize ──
+    # -- Organize --
 
     def _start_organize(self):
         output = self.output_input.text()
@@ -462,7 +635,7 @@ class MainWindow(QMainWindow):
                 "Uncheck 'Dry Run' in Settings and click 'Organize' again to actually move files."
             )
 
-    # ── Undo ──
+    # -- Undo --
 
     def _refresh_undo_list(self):
         self.undo_list.clear()
@@ -505,7 +678,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Undo Complete", msg)
         self._refresh_undo_list()
 
-    # ── Tree View ──
+    # -- Tree View --
 
     def _populate_tree(self):
         """Populate the file tree grouped by category."""
@@ -548,6 +721,22 @@ class MainWindow(QMainWindow):
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, column: int):
         fi = item.data(0, Qt.ItemDataRole.UserRole)
         if isinstance(fi, FileInfo):
+            # Show thumbnail for images
+            self._show_thumbnail(fi)
+
+            # Enable category reassignment
+            self.category_combo.setEnabled(True)
+            self.btn_reassign.setEnabled(True)
+            # Set current category in dropdown
+            try:
+                idx = ALL_CATEGORIES.index(fi.category.value)
+                self.category_combo.setCurrentIndex(idx)
+            except ValueError:
+                pass
+            # Store reference to current item for reassignment
+            self._selected_tree_item = item
+            self._selected_file_info = fi
+
             details = (
                 f"File: {fi.name}\n"
                 f"Path: {fi.path}\n"
@@ -570,7 +759,183 @@ class MainWindow(QMainWindow):
             self.detail_text.setText(details)
             self.tabs.setCurrentIndex(0)
 
-    # ── Statistics ──
+    def _show_thumbnail(self, fi: FileInfo):
+        """Show image thumbnail in the details panel."""
+        if fi.extension.lower() in IMAGE_EXTENSIONS:
+            try:
+                pixmap = QPixmap(str(fi.path))
+                if not pixmap.isNull():
+                    scaled = pixmap.scaled(
+                        QSize(380, 240),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    self.thumbnail_label.setPixmap(scaled)
+                    self.thumbnail_label.setVisible(True)
+                    return
+            except Exception:
+                pass
+        self.thumbnail_label.setVisible(False)
+        self.thumbnail_label.clear()
+
+    # -- Category Reassignment --
+
+    def _reassign_category(self):
+        """Manually reassign a file's category from the dropdown."""
+        if not hasattr(self, "_selected_file_info"):
+            return
+
+        new_cat_value = self.category_combo.currentText()
+        try:
+            new_category = FileCategory(new_cat_value)
+        except ValueError:
+            return
+
+        fi = self._selected_file_info
+        fi.category = new_category
+        fi.confidence = 1.0  # Manual assignment = 100% confidence
+
+        # Update tree item
+        item = self._selected_tree_item
+        item.setText(1, new_category.name)
+        item.setText(2, "100%")
+        item.setForeground(2, QColor(COLORS["success"]))
+
+        # Update details
+        self._on_tree_item_clicked(item, 0)
+        self._update_stats()
+        self.status_bar.showMessage(f"Reassigned '{fi.name}' to '{new_cat_value}'")
+
+    # -- Export CSV --
+
+    def _export_csv(self):
+        """Export classification results as CSV."""
+        if not self.files:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Report", "organization_report.csv", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "File Name", "Path", "Size (bytes)", "File Type",
+                    "Category", "Confidence", "Is Duplicate", "Modified"
+                ])
+                for fi in self.files:
+                    writer.writerow([
+                        fi.name, str(fi.path), fi.size_bytes, fi.file_type.value,
+                        fi.category.value, f"{fi.confidence:.2f}",
+                        fi.is_duplicate, fi.modified_time,
+                    ])
+
+            QMessageBox.information(self, "Export Complete", f"Report saved to:\n{path}")
+            self.status_bar.showMessage(f"Exported {len(self.files)} files to CSV")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", f"Failed to export:\n{e}")
+
+    # -- Custom Rules --
+
+    def _load_rules_to_table(self):
+        """Load custom rules from config into the table."""
+        self.rules_table.setRowCount(0)
+        for rule in self.config.custom_rules:
+            row = self.rules_table.rowCount()
+            self.rules_table.insertRow(row)
+            self.rules_table.setItem(row, 0, QTableWidgetItem(rule.get("keywords", "")))
+            # Category dropdown in cell
+            combo = QComboBox()
+            combo.addItems(ALL_CATEGORIES)
+            cat_val = rule.get("category", "")
+            try:
+                idx = ALL_CATEGORIES.index(cat_val)
+                combo.setCurrentIndex(idx)
+            except ValueError:
+                pass
+            self.rules_table.setCellWidget(row, 1, combo)
+
+    def _add_rule_row(self):
+        """Add an empty rule row."""
+        row = self.rules_table.rowCount()
+        self.rules_table.insertRow(row)
+        self.rules_table.setItem(row, 0, QTableWidgetItem(""))
+        combo = QComboBox()
+        combo.addItems(ALL_CATEGORIES)
+        self.rules_table.setCellWidget(row, 1, combo)
+
+    def _remove_rule_row(self):
+        """Remove the selected rule row."""
+        row = self.rules_table.currentRow()
+        if row >= 0:
+            self.rules_table.removeRow(row)
+
+    def _save_rules(self):
+        """Save custom rules from table to config."""
+        rules = []
+        for row in range(self.rules_table.rowCount()):
+            keywords_item = self.rules_table.item(row, 0)
+            combo = self.rules_table.cellWidget(row, 1)
+            if keywords_item and combo:
+                keywords = keywords_item.text().strip()
+                category = combo.currentText()
+                if keywords and category:
+                    rules.append({"keywords": keywords, "category": category})
+
+        self.config.custom_rules = rules
+        self.config.save()
+        self.status_bar.showMessage(f"Saved {len(rules)} custom rules")
+
+    # -- Folder Monitor (Watchdog) --
+
+    def _start_watching(self):
+        """Start monitoring a folder for new files."""
+        watch_dir = self.watch_input.text()
+        if not watch_dir:
+            QMessageBox.warning(self, "No Directory", "Select a directory to monitor.")
+            return
+
+        try:
+            self.watcher_worker = WatcherWorker(Path(watch_dir))
+            self.watcher_worker.new_file.connect(self._on_new_file_detected)
+            self.watcher_worker.error.connect(self._on_watch_error)
+            self.watcher_worker.start()
+
+            self.btn_start_watch.setEnabled(False)
+            self.btn_stop_watch.setEnabled(True)
+            self.watch_status.setText(f"Status: Monitoring {watch_dir}")
+            self.watch_status.setStyleSheet(f"color: {COLORS['success']};")
+            self.config.watch_dir = watch_dir
+        except Exception as e:
+            QMessageBox.critical(self, "Watch Error", str(e))
+
+    def _stop_watching(self):
+        """Stop folder monitoring."""
+        if self.watcher_worker:
+            self.watcher_worker.stop_watching()
+            self.watcher_worker.quit()
+            self.watcher_worker.wait(3000)
+            self.watcher_worker = None
+
+        self.btn_start_watch.setEnabled(True)
+        self.btn_stop_watch.setEnabled(False)
+        self.watch_status.setText("Status: Not monitoring")
+        self.watch_status.setStyleSheet(f"color: {COLORS['text_secondary']};")
+
+    def _on_new_file_detected(self, path_str: str):
+        """Handle a newly detected file."""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        self.watch_log.append(f"[{timestamp}] New file: {path_str}")
+
+    def _on_watch_error(self, error: str):
+        self.watch_log.append(f"[ERROR] {error}")
+        self._stop_watching()
+
+    # -- Statistics --
 
     def _update_stats(self):
         if not self.files:
@@ -607,7 +972,7 @@ class MainWindow(QMainWindow):
 
         self.stats_text.setText(stats)
 
-    # ── Helpers ──
+    # -- Helpers --
 
     def _check_llm_status(self):
         """Check and display Ollama/LLM availability."""
@@ -652,11 +1017,29 @@ class MainWindow(QMainWindow):
         except ImportError:
             lines.append(f"  [MISSING]  Ollama (optional - AI classification)")
 
+        # Check watchdog
+        try:
+            import watchdog  # noqa: F401
+            lines.append(f"  [     OK]  Watchdog (folder monitoring)")
+        except ImportError:
+            lines.append(f"  [MISSING]  Watchdog (optional - folder monitoring)")
+
         lines.append("")
         lines.append("Missing libraries? Run:  pip install <package-name>")
         lines.append("App works without Ollama using rule-based classification.")
 
         self.lib_status_text.setText("\n".join(lines))
+
+    def _clear_cache(self):
+        """Clear the classification cache."""
+        try:
+            from src.core.cache import ClassificationCache
+            cache = ClassificationCache()
+            cache.clear()
+            cache.close()
+            self.status_bar.showMessage("Classification cache cleared")
+        except Exception as e:
+            self.status_bar.showMessage(f"Failed to clear cache: {e}")
 
     def _set_busy(self, busy: bool, message: str = ""):
         """Toggle UI busy state."""
@@ -769,4 +1152,21 @@ class MainWindow(QMainWindow):
                 spacing: 8px;
                 padding: 4px;
             }}
+            QTableWidget {{
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                background: white;
+                alternate-background-color: #F1F5F9;
+            }}
+            QComboBox {{
+                border: 1px solid {COLORS['border']};
+                border-radius: 4px;
+                padding: 4px 8px;
+                background: white;
+            }}
         """)
+
+    def closeEvent(self, event):
+        """Clean up on close."""
+        self._stop_watching()
+        super().closeEvent(event)

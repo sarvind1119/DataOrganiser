@@ -14,8 +14,18 @@ class RuleBasedClassifier:
     Returns (category, confidence) tuple.
     """
 
+    def __init__(self, config=None):
+        self.custom_rules: list[dict] = []
+        if config and hasattr(config, "custom_rules"):
+            self.custom_rules = config.custom_rules or []
+
     def classify(self, file_info: FileInfo, text: str = "") -> tuple[FileCategory, float]:
         """Classify a file. Returns (category, confidence 0.0-1.0)."""
+
+        # 0. Try custom user rules first (highest priority)
+        cat, conf = self._classify_by_custom_rules(file_info, text)
+        if conf >= 0.8:
+            return cat, conf
 
         # 1. Try filename/path based rules first
         cat, conf = self._classify_by_path(file_info)
@@ -247,3 +257,24 @@ class RuleBasedClassifier:
     def _count_matches(text: str, keywords: list[str]) -> int:
         """Count how many keywords appear in the text."""
         return sum(1 for kw in keywords if kw in text)
+
+    def _classify_by_custom_rules(self, fi: FileInfo, text: str) -> tuple[FileCategory, float]:
+        """Apply user-defined custom rules. Each rule has keywords and a target category."""
+        if not self.custom_rules:
+            return FileCategory.OTHER, 0.0
+
+        combined = (fi.name + " " + text).lower()
+        for rule in self.custom_rules:
+            keywords = [kw.strip().lower() for kw in rule.get("keywords", "").split(",") if kw.strip()]
+            category_name = rule.get("category", "")
+            if not keywords or not category_name:
+                continue
+            matched = sum(1 for kw in keywords if kw in combined)
+            if matched >= max(1, len(keywords) // 2):
+                try:
+                    category = FileCategory(category_name)
+                    return category, 0.9
+                except ValueError:
+                    continue
+
+        return FileCategory.OTHER, 0.0

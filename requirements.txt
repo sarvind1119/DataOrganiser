@@ -10,3 +10,9 @@ chardet>=5.0.0
 
 # AI classification via local LLM
 ollama>=0.3.0
+
+# OCR for scanned documents
+pytesseract>=0.3.10
+
+# Real-time folder monitoring
+watchdog>=4.0.0

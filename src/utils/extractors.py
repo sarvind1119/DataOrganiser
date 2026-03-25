@@ -65,6 +65,13 @@ try:
 except ImportError:
     pass
 
+_HAS_TESSERACT = False
+try:
+    import pytesseract  # noqa: F401
+    _HAS_TESSERACT = True
+except ImportError:
+    pass
+
 
 def get_available_extractors() -> dict[str, bool]:
     """Return which extractors are available (for UI status display)."""
@@ -75,6 +82,7 @@ def get_available_extractors() -> dict[str, bool]:
         "PowerPoint (python-pptx)": _HAS_PPTX,
         "Images/EXIF (Pillow)": _HAS_PILLOW,
         "Encoding detection (chardet)": _HAS_CHARDET,
+        "OCR (Tesseract)": _HAS_TESSERACT,
     }
 
 
@@ -142,8 +150,7 @@ def extract_image_metadata(file_info: FileInfo) -> dict:
 
 
 def _extract_pdf(path: Path) -> str:
-    """Extract text from PDF using PyMuPDF."""
-    # pymupdf >= 1.24 uses `import pymupdf`, older versions use `import fitz`
+    """Extract text from PDF using PyMuPDF, with OCR fallback for scanned docs."""
     try:
         import pymupdf as pdf_lib
     except ImportError:
@@ -151,12 +158,67 @@ def _extract_pdf(path: Path) -> str:
 
     text_parts = []
     with pdf_lib.open(str(path)) as doc:
-        # Read first 10 pages max for classification
         for page_num in range(min(len(doc), 10)):
             page = doc[page_num]
             text_parts.append(page.get_text())
 
+    text = "\n".join(text_parts).strip()
+
+    # If very little text extracted, try OCR (scanned PDF)
+    if len(text) < 50 and _HAS_TESSERACT and _HAS_PILLOW:
+        logger.info(f"Low text from PDF, attempting OCR: {path.name}")
+        text = _ocr_pdf(path)
+
+    return text
+
+
+def _ocr_pdf(path: Path) -> str:
+    """OCR a scanned PDF by rendering pages to images."""
+    try:
+        import pymupdf as pdf_lib
+    except ImportError:
+        import fitz as pdf_lib
+
+    import pytesseract
+    from PIL import Image
+    import io
+
+    text_parts = []
+    try:
+        with pdf_lib.open(str(path)) as doc:
+            for page_num in range(min(len(doc), 5)):  # OCR first 5 pages max
+                page = doc[page_num]
+                # Render page at 200 DPI for OCR
+                pix = page.get_pixmap(dpi=200)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                # Use English + Hindi for Indian documents
+                ocr_text = pytesseract.image_to_string(img, lang="eng+hin")
+                if ocr_text.strip():
+                    text_parts.append(ocr_text.strip())
+    except Exception as e:
+        logger.warning(f"OCR failed for {path.name}: {e}")
+
     return "\n".join(text_parts)
+
+
+def ocr_image(file_info: FileInfo) -> str:
+    """OCR an image file to extract text (useful for scanned documents saved as images)."""
+    if not _HAS_TESSERACT or not _HAS_PILLOW:
+        return ""
+
+    import pytesseract
+    from PIL import Image
+
+    try:
+        with Image.open(file_info.path) as img:
+            # Convert to RGB if needed
+            if img.mode not in ("L", "RGB"):
+                img = img.convert("RGB")
+            text = pytesseract.image_to_string(img, lang="eng+hin")
+            return _clean_text(text) if text.strip() else ""
+    except Exception as e:
+        logger.debug(f"OCR failed for {file_info.path}: {e}")
+        return ""
 
 
 def _extract_docx(path: Path) -> str:

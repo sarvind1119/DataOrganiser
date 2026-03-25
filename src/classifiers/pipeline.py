@@ -1,4 +1,4 @@
-"""Classification pipeline - combines rule-based and LLM classifiers."""
+"""Classification pipeline - combines rule-based and LLM classifiers with caching."""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from src.core.config import AppConfig
 from src.core.models import FileCategory, FileInfo, FileType
 from src.classifiers.rule_based import RuleBasedClassifier
 from src.classifiers.llm_classifier import LLMClassifier
-from src.utils.extractors import extract_text, extract_image_metadata
+from src.core.cache import ClassificationCache
+from src.utils.extractors import extract_text, extract_image_metadata, ocr_image
 
 logger = logging.getLogger(__name__)
 
@@ -25,38 +26,56 @@ class ClassificationPipeline:
     Two-stage classification pipeline:
     1. Rule-based classifier (fast, pattern matching)
     2. LLM classifier (slower, used for ambiguous files)
+
+    With SQLite caching to skip re-classification of unchanged files.
     """
 
     def __init__(self, config: AppConfig):
         self.config = config
-        self.rule_classifier = RuleBasedClassifier()
+        self.rule_classifier = RuleBasedClassifier(config)
         self.llm_classifier = LLMClassifier(config) if config.use_llm else None
+        self.cache = ClassificationCache() if config.use_cache else None
+        self._cache_hits = 0
 
     def classify_files(
         self,
         files: list[FileInfo],
         progress_callback: Callable[[int, int, str], None] | None = None,
     ) -> list[FileInfo]:
-        """
-        Classify all files in the list.
-
-        Args:
-            files: List of FileInfo objects to classify.
-            progress_callback: Called with (current, total, status_message).
-        """
+        """Classify all files in the list."""
         total = len(files)
         llm_available = self.llm_classifier and self.llm_classifier.is_available()
+        self._cache_hits = 0
 
         for i, fi in enumerate(files):
             if progress_callback and i % 10 == 0:
                 progress_callback(i, total, f"Classifying: {fi.name}")
 
+            # Check cache first
+            if self.cache:
+                cached = self.cache.get(fi)
+                if cached:
+                    fi.category, fi.confidence = cached
+                    self._cache_hits += 1
+                    continue
+
             self._classify_single(fi, llm_available)
+
+            # Store in cache
+            if self.cache and fi.category:
+                self.cache.put(fi)
+
+        if self._cache_hits > 0:
+            logger.info(f"Cache hits: {self._cache_hits}/{total}")
 
         if progress_callback:
             progress_callback(total, total, "Classification complete")
 
         return files
+
+    @property
+    def cache_hits(self) -> int:
+        return self._cache_hits
 
     def _classify_single(self, fi: FileInfo, llm_available: bool):
         """Classify a single file through the pipeline."""
@@ -69,8 +88,13 @@ class ClassificationPipeline:
         # Step 1b: Extract image metadata
         if fi.file_type == FileType.IMAGE:
             fi.metadata = extract_image_metadata(fi)
+            # Step 1c: OCR images if enabled and no text yet
+            if not text and self.config.use_ocr:
+                text = ocr_image(fi)
+                if text:
+                    fi.content_preview = text[:500]
 
-        # Step 2: Rule-based classification
+        # Step 2: Rule-based classification (now with custom rules support)
         category, confidence = self.rule_classifier.classify(fi, text)
 
         # Step 3: If rule-based isn't confident enough, try LLM
@@ -83,3 +107,8 @@ class ClassificationPipeline:
 
         fi.category = category
         fi.confidence = confidence
+
+    def close(self):
+        """Clean up resources."""
+        if self.cache:
+            self.cache.close()
